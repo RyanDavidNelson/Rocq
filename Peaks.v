@@ -1,36 +1,59 @@
 (* ===================================================================== *)
 (*  Peaks.v                                                              *)
 (*                                                                       *)
-(*  EXACT model of the extractor (speckle.c get_speckles + the Python    *)
-(*  _merge_peaks post-step).  Two C variants:                            *)
+(*  EXACT functional model of the speckle extractor's DEFAULT mode       *)
+(*  (speckle.c get_speckles, algorithm_variant == GS_DEFAULT, used by     *)
+(*  peaks_processing.py _get_peaks).  EXTRACT_REGIONS is built in         *)
+(*  unconditionally -- this models the speckle.h build with              *)
+(*  `#define EXTRACT_REGIONS 1`, i.e. explore_path + explore_region.      *)
 (*                                                                       *)
-(*   GS_DEFAULT (variant 0, used by _get_peaks):                         *)
-(*     explore_path makes every pixel ascend, via the offset scan, to    *)
-(*     the FIRST strictly-greater neighbour (branchless `replace =       *)
-(*     val > move_intensity`); out-of-bounds neighbours read as 0.  A    *)
-(*     pixel that is a STRICT local maximum solves to itself.  A pixel    *)
-(*     whose maximum is tied with >=1 in-bounds neighbour (a plateau)     *)
-(*     is, in the DEFAULT build (EXTRACT_REGIONS is commented out in      *)
-(*     speckle.h), marked UNUSED and discarded -- so are the pixels that  *)
-(*     ascend into it.  A speckle's WEIGHT is its basin size (number of   *)
-(*     pixels solving to it).  Post-loop, only speckles with             *)
-(*     weight > threshold and whose location is in-bounds are kept.       *)
-(*       [The EXTRACT_REGIONS variant -- plateau -> region midpoint --   *)
-(*        is NOT the default build; modelled as a TODO note, not here.]  *)
+(*  Only the C `cardinal[]` / `all[]` offset arrays are used (from        *)
+(*  Image.v: c_cardinal / c_all, selected by c_offsets all_adjacent).    *)
+(*  GS_SIMPLE and the Python _merge_peaks / _get_adjacency_offsets        *)
+(*  post-steps are dead code and have been removed.                      *)
 (*                                                                       *)
-(*   GS_SIMPLE (variant 1, used by _get_peaks_simple):                   *)
-(*     connected-component flood fill over pixels with intensity >        *)
-(*     threshold (offset adjacency, OOB->0 so excluded); one speckle per  *)
-(*     component at its ROUNDED centroid, weight = component size; kept   *)
-(*     if the centroid is in-bounds.                                     *)
+(*  ---- What the C does (DEFAULT + EXTRACT_REGIONS) -------------------  *)
+(*  For every pixel the main loop calls explore_path, which "ascends" to  *)
+(*  the FIRST strictly-greater neighbour in offset-scan order            *)
+(*  (branchless `replace = val > move_intensity`), OOB neighbours read    *)
+(*  as 0.  The recursion memoises into solved_map; the value returned     *)
+(*  for a pixel is a speckle INDEX (>= BEGIN_SOLVE_REGION = 2) or a       *)
+(*  discard marker (UNVISITED 0 / UNUSED_REGION 1).  Per pixel:           *)
 (*                                                                       *)
-(*   _merge_peaks (peaks_processing.py): flood-fill connected speckles    *)
-(*     (adjacency on the peak coordinates, Python offset order), merge a  *)
-(*     component to (mean x, mean y [REAL-valued, per Python `/`],        *)
-(*     sum of weights); sort by weight descending.                       *)
+(*   * STRICT local maximum (no neighbour >= it: equal_ctr == 0 and       *)
+(*     move_intensity == intensity): solves to itself, index             *)
+(*     GET_INDEX(x,y).                                                    *)
 (*                                                                       *)
-(*  Offsets are passed in explicitly so the caller chooses cardinal/all   *)
-(*  with the correct (C vs Python) ordering from Image.v.                *)
+(*   * PLATEAU (>=1 in-bounds neighbour equal, none strictly greater:     *)
+(*     equal_ctr > 0 and move_intensity == intensity): explore_region     *)
+(*     floods the connected component of EQUAL-intensity in-bounds        *)
+(*     pixels (same offsets).  If ANY pixel of that component has an      *)
+(*     in-bounds neighbour of STRICTLY GREATER intensity, the whole       *)
+(*     region ascends and is discarded (every member -> UNUSED_REGION);   *)
+(*     otherwise the region is a flat-topped maximum and every member     *)
+(*     solves to ONE index, GET_INDEX(round(mean x), round(mean y)).      *)
+(*                                                                       *)
+(*   * ASCEND (move_intensity > intensity): solves to whatever the        *)
+(*     strictly-greater neighbour (move_x, move_y) solves to.             *)
+(*                                                                       *)
+(*  A speckle's WEIGHT is the number of grid pixels that solve to its     *)
+(*  index (the basin size, counting pixels that ascend into it).  Note    *)
+(*  the asymmetry the C exhibits and that this model reproduces: in a     *)
+(*  DISCARDED region, members that themselves have a greater neighbour    *)
+(*  re-ascend out to a higher peak (and count toward it), while members   *)
+(*  with no greater neighbour are dropped.  After the loop, a speckle is  *)
+(*  kept iff its index location is in the bounding box                    *)
+(*  [x_min,x_max] x [y_min,y_max] AND its weight > threshold.             *)
+(*                                                                       *)
+(*  ---- Why a pure recursion equals the stateful C ---------------------  *)
+(*  explore_path is deterministic and idempotent: solved_map only         *)
+(*  memoises the unique result, so the un-memoised recursion below        *)
+(*  computes the same value.  Ascent strictly increases intensity, so it  *)
+(*  terminates; region exploration is a terminating connected-component   *)
+(*  flood.  The region's connected EQUAL-intensity component and its      *)
+(*  centroid are independent of which member seeds the exploration, so    *)
+(*  every member (and every external pixel ascending in) resolves to the  *)
+(*  same index, exactly as the C's one-shot region assignment does.      *)
 (* ===================================================================== *)
 
 From Coq Require Import ZArith List Lia Bool Reals.
@@ -54,14 +77,20 @@ Definition gcoords (img : gimage) : list coord :=
 Definition inbox (xmin xmax ymin ymax x y : Z) : bool :=
   (xmin <=? x) && (x <=? xmax) && (ymin <=? y) && (y <=? ymax).
 
+(* round(a/b) (C `round`, half away from zero); a,b >= 0 here, so this is
+   round-half-up.  Used for the region centroid GET_INDEX coordinate. *)
+Definition zround_div (a : Z) (b : nat) : Z :=
+  if Nat.eqb b 0 then 0 else (2 * a + Z.of_nat b) / (2 * Z.of_nat b).
+
 (* ===================================================================== *)
-(*  GS_DEFAULT : ascent / strict local maxima / basin weights            *)
+(*  explore_path's offset scan                                           *)
 (* ===================================================================== *)
 
-(* The offset scan from explore_path.  State = (move_intensity, move_x,
-   move_y, equal_ctr).  `replace` is strict (val > move_intensity), so on
-   ties the FIRST occurrence is kept; equal_ctr counts in-bounds equals
-   since the last replace; OOB neighbours contribute value 0. *)
+(* State = (move_intensity, move_x, move_y, equal_ctr).  `replace` is
+   strict (val > move_intensity), so on ties the FIRST occurrence wins;
+   equal_ctr counts in-bounds neighbours equal to move_intensity since the
+   last replace (`equal_ctr = (!replace)*(equal_ctr + equal)`); OOB
+   neighbours contribute value 0 and are never "equal". *)
 Definition scan (img : gimage) (offs : list coord) (x y : Z)
   : (nat * Z * Z * nat) :=
   fold_left
@@ -80,129 +109,30 @@ Definition scan (img : gimage) (offs : list coord) (x y : Z)
        (mint', mx', my', ec'))
     offs (oob0 img x y, x, y, 0%nat).
 
-(* (x,y) is a STRICT local maximum: no in-bounds neighbour >= it. *)
-Definition is_smax (img : gimage) (offs : list coord) (x y : Z) : bool :=
-  let '(mint, _, _, ec) := scan img offs x y in
-  (Nat.eqb mint (oob0 img x y)) && (Nat.eqb ec 0).
-
+(* The three explore_path outcomes (before region handling). *)
 Inductive sres := RSolved (p : coord) | RPlateau | RAscend (p : coord).
 
 Definition classify (img : gimage) (offs : list coord) (x y : Z) : sres :=
   let '(mint, mx, my, ec) := scan img offs x y in
-  if Nat.eqb mint (oob0 img x y)
-  then (if Nat.eqb ec 0 then RSolved (x, y) else RPlateau)
-  else RAscend (mx, my).
-
-(* Where does a pixel's ascent terminate?  Some max | None (plateau/discard). *)
-Fixpoint solve (img : gimage) (offs : list coord) (fuel : nat) (p : coord)
-  : option coord :=
-  match classify img offs (fst p) (snd p) with
-  | RSolved q => Some q
-  | RPlateau => None
-  | RAscend q => match fuel with
-                 | O => None
-                 | S f => solve img offs f q
-                 end
-  end.
-
-Definition fuel0 (img : gimage) : nat := S (gw img * gh img).
-Definition solveP (img : gimage) (offs : list coord) (p : coord) : option coord :=
-  solve img offs (fuel0 img) p.
-
-(* Basin size of a candidate maximum c. *)
-Definition weight (img : gimage) (offs : list coord) (c : coord) : nat :=
-  length (filter (fun p => match solveP img offs p with
-                           | Some q => coord_eqb q c
-                           | None => false
-                           end)
-                 (gcoords img)).
-
-(* The GS_DEFAULT speckle list: strict maxima, in-bounds, basin > threshold. *)
-Definition peaks_default (img : gimage) (t : nat) (offs : list coord)
-                         (xmin xmax ymin ymax : Z) : list (Z * Z * nat) :=
-  fold_right
-    (fun c acc =>
-       let '(cx, cy) := c in
-       if (is_smax img offs cx cy)
-            && (inbox xmin xmax ymin ymax cx cy)
-            && (Nat.ltb t (weight img offs c))
-       then (cx, cy, weight img offs c) :: acc
-       else acc)
-    [] (gcoords img).
-
-Definition peaks_default_full (img : gimage) (t : nat) (offs : list coord)
-  : list (Z * Z * nat) :=
-  peaks_default img t offs 0 (zw img - 1) 0 (zh img - 1).
+  if Nat.eqb mint (oob0 img x y)            (* no strictly-greater neighbour *)
+  then (if Nat.eqb ec 0 then RSolved (x, y) (* strict local maximum *)
+        else RPlateau)                      (* flat: >=1 equal neighbour *)
+  else RAscend (mx, my).                     (* ascend to first greater *)
 
 (* ===================================================================== *)
-(*  GS_SIMPLE : connected-component flood fill                            *)
+(*  explore_region : flat connected component, ascend test, centroid     *)
 (* ===================================================================== *)
-
-(* round(a/b), half away from zero; here a,b >= 0 so it's round-half-up. *)
-Definition zround_div (a : Z) (b : nat) : Z :=
-  if Nat.eqb b 0 then 0 else (2 * a + Z.of_nat b) / (2 * Z.of_nat b).
 
 Definition floodfuel (img : gimage) (offs : list coord) : nat :=
   S (gw img * gh img * (S (length offs))).
 
-(* DFS flood fill: returns visited extended with the component of [stack]. *)
-Fixpoint flood (img : gimage) (t : nat) (offs : list coord)
-               (fuel : nat) (stack visited : list coord) : list coord :=
-  match fuel with
-  | O => visited
-  | S f =>
-    match stack with
-    | [] => visited
-    | p :: rest =>
-      if cmem p visited then flood img t offs f rest visited
-      else
-        let nbrs := map (fun o => (fst p + fst o, snd p + snd o)) offs in
-        let good := filter (fun q => (Nat.ltb t (oob0 img (fst q) (snd q)))
-                                       && negb (cmem q visited)) nbrs in
-        flood img t offs f (good ++ rest) (p :: visited)
-    end
-  end.
+(* a neighbour belongs to the region iff it is in-bounds and has exactly
+   the region intensity ri (matches `equal = (val==intensity) & in_bounds`). *)
+Definition same_int (img : gimage) (ri : nat) (q : coord) : bool :=
+  inb img (fst q) (snd q) && Nat.eqb (oob0 img (fst q) (snd q)) ri.
 
-Definition component (img : gimage) (t : nat) (offs : list coord)
-                     (visited : list coord) (seed : coord) : list coord :=
-  filter (fun q => negb (cmem q visited))
-         (flood img t offs (floodfuel img offs) [seed] visited).
-
-Definition simple_speckles (img : gimage) (t : nat) (offs : list coord)
-                           (xmin xmax ymin ymax : Z) : list (Z * Z * nat) :=
-  snd (fold_left
-         (fun st c =>
-            let '(visited, out) := st in
-            let '(cx, cy) := c in
-            if (Nat.ltb t (oob0 img cx cy)) && negb (cmem c visited)
-            then
-              let comp := component img t offs visited c in
-              let cnt := length comp in
-              let sx := fold_right (fun q a => fst q + a) 0 comp in
-              let sy := fold_right (fun q a => snd q + a) 0 comp in
-              let rx := zround_div sx cnt in
-              let ry := zround_div sy cnt in
-              if inbox xmin xmax ymin ymax rx ry
-              then (comp ++ visited, out ++ [(rx, ry, cnt)])
-              else (comp ++ visited, out)
-            else st)
-         (gcoords img) ([], [])).
-
-Definition simple_speckles_full (img : gimage) (t : nat) (offs : list coord)
-  : list (Z * Z * nat) :=
-  simple_speckles img t offs 0 (zw img - 1) 0 (zh img - 1).
-
-(* ===================================================================== *)
-(*  _merge_peaks  (real-valued merged centroids, sorted by weight desc.)  *)
-(* ===================================================================== *)
-
-Definition pk_coord (p : Z * Z * nat) : coord := let '(x, y, _) := p in (x, y).
-Definition pk_w (p : Z * Z * nat) : nat := let '(_, _, w) := p in w.
-Definition pk_mem (c : coord) (l : list (Z * Z * nat)) : bool :=
-  existsb (fun p => coord_eqb (pk_coord p) c) l.
-
-(* flood over the peak-coordinate adjacency graph *)
-Fixpoint pflood (peaks : list (Z * Z * nat)) (offs : list coord)
+(* DFS flood over the equal-intensity adjacency; returns the component. *)
+Fixpoint rflood (img : gimage) (offs : list coord) (ri : nat)
                 (fuel : nat) (stack visited : list coord) : list coord :=
   match fuel with
   | O => visited
@@ -210,62 +140,111 @@ Fixpoint pflood (peaks : list (Z * Z * nat)) (offs : list coord)
     match stack with
     | [] => visited
     | p :: rest =>
-      if cmem p visited then pflood peaks offs f rest visited
+      if cmem p visited then rflood img offs ri f rest visited
       else
         let nbrs := map (fun o => (fst p + fst o, snd p + snd o)) offs in
-        let good := filter (fun q => (pk_mem q peaks) && negb (cmem q visited)) nbrs in
-        pflood peaks offs f (good ++ rest) (p :: visited)
+        let good := filter (fun q => same_int img ri q && negb (cmem q visited)) nbrs in
+        rflood img offs ri f (good ++ rest) (p :: visited)
     end
   end.
 
-Definition pcomponent (peaks : list (Z * Z * nat)) (offs : list coord)
-                      (visited : list coord) (seed : coord) : list coord :=
-  filter (fun q => negb (cmem q visited))
-         (pflood peaks offs (S (length peaks * S (length offs))) [seed] visited).
+(* The connected EQUAL-intensity region containing seed s (s in-bounds). *)
+Definition region (img : gimage) (offs : list coord) (s : coord) : list coord :=
+  rflood img offs (oob0 img (fst s) (snd s)) (floodfuel img offs) [s] [].
 
-(* weight of a coord within the peak list (0 if absent) *)
-Definition wat (peaks : list (Z * Z * nat)) (c : coord) : nat :=
-  fold_right (fun p acc => if coord_eqb (pk_coord p) c then (acc + pk_w p)%nat else acc)
-             0%nat peaks.
+(* does pixel p have an in-bounds neighbour strictly greater than ri?
+   (`ascend = val > max_intensity`, max starting at ri; OOB val is 0). *)
+Definition pixel_ascends (img : gimage) (offs : list coord) (ri : nat)
+                         (p : coord) : bool :=
+  existsb (fun o =>
+             let qx := fst p + fst o in
+             let qy := snd p + snd o in
+             inb img qx qy && Nat.ltb ri (oob0 img qx qy))
+          offs.
 
-(* weight projection for merged real-valued peaks *)
-Definition pk_w_r (p : R * R * nat) : nat := let '(_, _, w) := p in w.
+(* the region ascends (is discarded) iff ANY member has a greater neighbour. *)
+Definition region_ascends (img : gimage) (offs : list coord) (ri : nat)
+                          (R : list coord) : bool :=
+  existsb (pixel_ascends img offs ri) R.
 
-(* insertion sort by weight, descending *)
-Fixpoint insert_desc (x : R * R * nat) (l : list (R * R * nat)) : list (R * R * nat) :=
-  match l with
-  | [] => [x]
-  | y :: ys => if Nat.leb (pk_w_r y) (pk_w_r x)
-               then x :: y :: ys
-               else y :: insert_desc x ys
+(* GET_INDEX(round(mean x), round(mean y)) location = rounded centroid. *)
+Definition region_centroid (R : list coord) : coord :=
+  let cnt := length R in
+  let sx := fold_right (fun q a => fst q + a) 0 R in
+  let sy := fold_right (fun q a => snd q + a) 0 R in
+  (zround_div sx cnt, zround_div sy cnt).
+
+(* ===================================================================== *)
+(*  solve : the index (as a coordinate) a pixel resolves to, or None     *)
+(*          for a discard (UNVISITED / UNUSED_REGION).                    *)
+(* ===================================================================== *)
+
+Fixpoint solve (img : gimage) (offs : list coord) (fuel : nat) (p : coord)
+  : option coord :=
+  match classify img offs (fst p) (snd p) with
+  | RSolved q => Some q
+  | RPlateau =>
+      let ri := oob0 img (fst p) (snd p) in
+      let R := region img offs p in
+      if region_ascends img offs ri R then None
+      else Some (region_centroid R)
+  | RAscend q => match fuel with
+                 | O => None
+                 | S f => solve img offs f q
+                 end
   end.
 
-Fixpoint sort_desc (l : list (R * R * nat)) : list (R * R * nat) :=
-  match l with
-  | [] => []
-  | x :: xs => insert_desc x (sort_desc xs)
-  end.
+(* Ascent strictly increases intensity, so a chain visits each pixel at
+   most once; gw*gh+1 is a safe fuel bound. *)
+Definition fuel0 (img : gimage) : nat := S (gw img * gh img).
+Definition solveP (img : gimage) (offs : list coord) (p : coord) : option coord :=
+  solve img offs (fuel0 img) p.
 
-Definition merge_peaks (peaks : list (Z * Z * nat)) (offs : list coord)
-  : list (R * R * nat) :=
-  let merged :=
-    snd (fold_left
-           (fun st p =>
-              let '(visited, out) := st in
-              let c := pk_coord p in
-              if pk_mem c peaks && negb (cmem c visited)
-              then
-                let comp := pcomponent peaks offs visited c in
-                let cnt := length comp in
-                let sx := fold_right (fun q a => fst q + a) 0 comp in
-                let sy := fold_right (fun q a => snd q + a) 0 comp in
-                let wsum := fold_right (fun q a => a + wat peaks q)%nat 0%nat comp in
-                let rx := (IZR sx / INR cnt)%R in
-                let ry := (IZR sy / INR cnt)%R in
-                (comp ++ visited, out ++ [(rx, ry, wsum)])
-              else st)
-           peaks ([], [])) in
-  sort_desc merged.
+(* ===================================================================== *)
+(*  Speckle accounting : basin weights + final threshold/box filter      *)
+(* ===================================================================== *)
+
+(* Basin size of a candidate index c: how many grid pixels solve to c. *)
+Definition weight (img : gimage) (offs : list coord) (c : coord) : nat :=
+  length (filter (fun p => match solveP img offs p with
+                           | Some q => coord_eqb q c
+                           | None => false
+                           end)
+                 (gcoords img)).
+
+(* Distinct speckle indices = distinct solveP results over the grid, in
+   first-seen (C traversal) order. *)
+Definition candidates (img : gimage) (offs : list coord) : list coord :=
+  fold_left
+    (fun acc p => match solveP img offs p with
+                  | Some q => if cmem q acc then acc else acc ++ [q]
+                  | None => acc
+                  end)
+    (gcoords img) [].
+
+(* GS_DEFAULT (EXTRACT_REGIONS) speckle list: index in the bounding box
+   AND basin weight strictly greater than the threshold. *)
+Definition peaks_default (img : gimage) (t : nat) (offs : list coord)
+                         (xmin xmax ymin ymax : Z) : list (Z * Z * nat) :=
+  fold_right
+    (fun c acc =>
+       let '(cx, cy) := c in
+       if inbox xmin xmax ymin ymax cx cy && Nat.ltb t (weight img offs c)
+       then (cx, cy, weight img offs c) :: acc
+       else acc)
+    [] (candidates img offs).
+
+(* ---- Public entry points, matching the Python _get_peaks call. -------
+   `all_adjacent` selects the C offset array (c_offsets), exactly as
+   peaks_processing.py passes (adjacency == 'all'). *)
+Definition peaks (img : gimage) (t : nat) (all_adjacent : bool)
+                 (xmin xmax ymin ymax : Z) : list (Z * Z * nat) :=
+  peaks_default img t (c_offsets all_adjacent) xmin xmax ymin ymax.
+
+(* Whole-image bounding box (every in-bounds index admissible). *)
+Definition peaks_full (img : gimage) (t : nat) (all_adjacent : bool)
+  : list (Z * Z * nat) :=
+  peaks img t all_adjacent 0 (zw img - 1) 0 (zh img - 1).
 
 (* ===================================================================== *)
 (*  Shared element-grid geometry  (peaks_processing.py)                  *)

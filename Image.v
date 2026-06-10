@@ -67,10 +67,14 @@ Definition gfrom_list (w h : nat) (d : list nat) : gimage :=
 (*  Adjacency / offset orderings -- ORDER IS SIGNIFICANT.                *)
 (*                                                                       *)
 (*  The C extractor's tie-breaking (`explore_path`) depends on the order *)
-(*  in which offsets are scanned, so the C orderings must be preserved   *)
-(*  verbatim.  The Python `_get_adjacency_offsets` (used only by         *)
-(*  `_merge_peaks`, where offsets test set-membership) uses a DIFFERENT  *)
-(*  order; for merging the order is immaterial, but we keep it faithful. *)
+(*  in which offsets are scanned, so the C orderings are preserved       *)
+(*  verbatim.  These are the ONLY offset arrays in the system: the C     *)
+(*  extractor defines `cardinal[]` and `all[]` internally and selects    *)
+(*  between them with the `all_adjacent` flag (which the Python sets to  *)
+(*  (adjacency == 'all')).  The Python no longer carries any offset      *)
+(*  arrays of its own -- `_get_adjacency_offsets` was only ever used by  *)
+(*  `_merge_peaks`, and both have been removed -- so the distinct Python  *)
+(*  orderings that used to live here are gone too.                       *)
 (*                                                                       *)
 (*  All offsets are (x_off, y_off).                                      *)
 (* ===================================================================== *)
@@ -83,18 +87,7 @@ Definition c_cardinal : list (Z * Z) :=
 Definition c_all : list (Z * Z) :=
   [ (0,1); (1,1); (1,0); (1,-1); (0,-1); (-1,-1); (-1,0); (-1,1) ].
 
-(* peaks_processing.py _get_adjacency_offsets('cardinal') *)
-Definition py_cardinal : list (Z * Z) :=
-  [ (-1,0); (0,-1); (1,0); (0,1) ].
-
-(* peaks_processing.py _get_adjacency_offsets('all') *)
-Definition py_all : list (Z * Z) :=
-  [ (-1,0); (-1,-1); (0,-1); (1,-1); (1,0); (1,1); (0,1); (-1,1) ].
-
 (* The C extractor selects between these via the `all_adjacent` flag,
    which `_get_peaks` sets to (adjacency == 'all'). *)
 Definition c_offsets (all_adjacent : bool) : list (Z * Z) :=
   if all_adjacent then c_all else c_cardinal.
-
-Definition py_offsets (all_adjacent : bool) : list (Z * Z) :=
-  if all_adjacent then py_all else py_cardinal.
