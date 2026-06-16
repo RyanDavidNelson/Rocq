@@ -57,12 +57,26 @@
 (* ===================================================================== *)
 
 From Coq Require Import ZArith List Lia Bool Reals.
+From Coq Require Import FSets.FMapAVL Structures.OrderedTypeEx.
 Import ListNotations.
 From SpecklePUF Require Import Image.
 
 Local Open Scope Z_scope.
 
 Definition coord := (Z * Z)%type.
+
+(* ===================================================================== *)
+(*  A balanced-tree map keyed by a packed coordinate, used purely as a   *)
+(*  performance memo for the solve pass (and for O(log n) dedup/counts   *)
+(*  in the accounting layer).  It changes NOTHING about the per-pixel    *)
+(*  result: [ckey] is injective on the in-bounds coordinates that ever   *)
+(*  occur as solve results / region members (0 <= x, 0 <= y < h), so the *)
+(*  map faithfully represents a function coord -> _ over that domain.    *)
+(* ===================================================================== *)
+Module ZM := FMapAVL.Make Z_as_OT.
+
+(* pack an in-bounds coord into a single Z key (stride = image height). *)
+Definition ckey (img : gimage) (p : coord) : Z := fst p * zh img + snd p.
 
 Definition coord_eqb (a b : coord) : bool :=
   (fst a =? fst b) && (snd a =? snd b).
@@ -131,26 +145,34 @@ Definition floodfuel (img : gimage) (offs : list coord) : nat :=
 Definition same_int (img : gimage) (ri : nat) (q : coord) : bool :=
   inb img (fst q) (snd q) && Nat.eqb (oob0 img (fst q) (snd q)) ri.
 
-(* DFS flood over the equal-intensity adjacency; returns the component. *)
+(* DFS flood over the equal-intensity adjacency; returns the component.
+   [vis] is a visited SET (map to unit) for O(log n) membership, replacing
+   the former O(n) list scan.  The RETURNED list is the same connected
+   EQUAL-intensity component, each member exactly once; its order is
+   irrelevant downstream (only used by region_ascends/existsb and
+   region_centroid/sum, both order-independent, and as a member set). *)
 Fixpoint rflood (img : gimage) (offs : list coord) (ri : nat)
-                (fuel : nat) (stack visited : list coord) : list coord :=
+                (fuel : nat) (stack : list coord)
+                (vis : ZM.t unit) (acc : list coord) : list coord :=
   match fuel with
-  | O => visited
+  | O => acc
   | S f =>
     match stack with
-    | [] => visited
+    | [] => acc
     | p :: rest =>
-      if cmem p visited then rflood img offs ri f rest visited
+      if ZM.mem (ckey img p) vis then rflood img offs ri f rest vis acc
       else
         let nbrs := map (fun o => (fst p + fst o, snd p + snd o)) offs in
-        let good := filter (fun q => same_int img ri q && negb (cmem q visited)) nbrs in
-        rflood img offs ri f (good ++ rest) (p :: visited)
+        let good := filter (fun q => same_int img ri q
+                                     && negb (ZM.mem (ckey img q) vis)) nbrs in
+        rflood img offs ri f (good ++ rest) (ZM.add (ckey img p) tt vis) (p :: acc)
     end
   end.
 
 (* The connected EQUAL-intensity region containing seed s (s in-bounds). *)
 Definition region (img : gimage) (offs : list coord) (s : coord) : list coord :=
-  rflood img offs (oob0 img (fst s) (snd s)) (floodfuel img offs) [s] [].
+  rflood img offs (oob0 img (fst s) (snd s)) (floodfuel img offs)
+         [s] (ZM.empty unit) [].
 
 (* does pixel p have an in-bounds neighbour strictly greater than ri?
    (`ascend = val > max_intensity`, max starting at ri; OOB val is 0). *)
@@ -202,37 +224,126 @@ Definition solveP (img : gimage) (offs : list coord) (p : coord) : option coord 
 
 (* ===================================================================== *)
 (*  Speckle accounting : basin weights + final threshold/box filter      *)
+(*                                                                       *)
+(*  The naive layer recomputed [solveP] for every grid pixel inside      *)
+(*  [weight], and [weight] for every candidate (twice) inside            *)
+(*  [peaks_default] -- O(N) solveP evaluations per candidate, i.e. up to *)
+(*  O(N^2) solveP calls, each of which (for a plateau) re-ran the region *)
+(*  flood from scratch.  The version below computes each pixel's result  *)
+(*  EXACTLY ONCE and reuses it, mirroring the C extractor's solved_map   *)
+(*  memoisation, and floods each equal-intensity region once.  The       *)
+(*  per-pixel result is bit-for-bit the [solveP] value (see the          *)
+(*  correspondence notes inline), so the candidate list, the basin       *)
+(*  weights and the final peak list are unchanged.                       *)
 (* ===================================================================== *)
 
-(* Basin size of a candidate index c: how many grid pixels solve to c. *)
-Definition weight (img : gimage) (offs : list coord) (c : coord) : nat :=
-  length (filter (fun p => match solveP img offs p with
-                           | Some q => coord_eqb q c
-                           | None => false
-                           end)
-                 (gcoords img)).
+(* A solved map: ckey(pixel) |-> its solve result (Some index / None).   *)
+Definition solvedmap := ZM.t (option coord).
 
-(* Distinct speckle indices = distinct solveP results over the grid, in
-   first-seen (C traversal) order. *)
-Definition candidates (img : gimage) (offs : list coord) : list coord :=
-  fold_left
-    (fun acc p => match solveP img offs p with
-                  | Some q => if cmem q acc then acc else acc ++ [q]
-                  | None => acc
-                  end)
-    (gcoords img) [].
+(* increment the basin counter for key k. *)
+Definition bump (wm : ZM.t nat) (k : Z) : ZM.t nat :=
+  match ZM.find k wm with
+  | Some n => ZM.add k (S n) wm
+  | None   => ZM.add k 1%nat wm
+  end.
+
+(* Solve one pixel, memoising into m, and -- crucially -- writing the
+   shared result to every member of an equal-intensity region so that
+   region is flooded only once and its members are never re-solved.
+
+   Correspondence with [solveP] (the unchanged spec), per pixel:
+   * RSolved q          : result Some q                         (= solveP).
+   * RPlateau, flat max : region_ascends = false, so NO member has a
+       strictly-greater neighbour; every member is therefore itself an
+       RPlateau pixel whose [solveP] is Some (region_centroid) of the SAME
+       component (seed-independent).  Writing that one value to all members
+       equals each member's solveP.
+   * RPlateau, discarded: region_ascends = true.  A member with a greater
+       neighbour is an RAscend pixel (handled on its own turn, ascending
+       out -- exactly solveP); a member with NO greater neighbour is an
+       RPlateau pixel whose solveP is None.  We therefore write None to
+       precisely the non-ascending members (the seed among them), leaving
+       the ascending members to resolve individually.
+   * RAscend q          : follow the chain (memoised), result = solve of q
+       (= solveP, by the same idempotence used throughout this model). *)
+Fixpoint solve_mem (img : gimage) (offs : list coord) (fuel : nat)
+                   (m : solvedmap) (p : coord) : (option coord * solvedmap) :=
+  match ZM.find (ckey img p) m with
+  | Some r => (r, m)                                   (* already solved *)
+  | None =>
+    match classify img offs (fst p) (snd p) with
+    | RSolved q => let r := Some q in (r, ZM.add (ckey img p) r m)
+    | RPlateau =>
+        let ri := oob0 img (fst p) (snd p) in
+        let R  := region img offs p in
+        if region_ascends img offs ri R
+        then (* discarded: drop the non-ascending members (solveP = None) *)
+          let drop := filter (fun q => negb (pixel_ascends img offs ri q)) R in
+          (None, fold_left (fun mm q => ZM.add (ckey img q) None mm) drop m)
+        else (* flat-topped maximum: all members share this index *)
+          let r := Some (region_centroid R) in
+          (r, fold_left (fun mm q => ZM.add (ckey img q) r mm) R m)
+    | RAscend q =>
+        match fuel with
+        | O => (None, ZM.add (ckey img p) None m)
+        | S f => let '(r, m') := solve_mem img offs f m q in
+                 (r, ZM.add (ckey img p) r m')
+        end
+    end
+  end.
+
+(* One left-to-right (C traversal order) pass that solves every pixel. *)
+Definition solved_map (img : gimage) (offs : list coord) : solvedmap :=
+  fold_left (fun m p => snd (solve_mem img offs (fuel0 img) m p))
+            (gcoords img) (ZM.empty (option coord)).
+
+(* Result of a pixel after the pass (every gcoord is present). *)
+Definition mlookup (img : gimage) (m : solvedmap) (p : coord) : option coord :=
+  match ZM.find (ckey img p) m with Some r => r | None => None end.
+
+(* Distinct speckle indices = distinct solve results over the grid, in
+   first-seen (C traversal) order -- identical to the naive [candidates],
+   with O(log n) dedup via a seen-set. *)
+Definition candidates_from (img : gimage) (m : solvedmap) : list coord :=
+  let '(acc, _) :=
+    fold_left
+      (fun st p =>
+         let '(acc, seen) := st in
+         match mlookup img m p with
+         | Some q => let k := ckey img q in
+                     if ZM.mem k seen then (acc, seen)
+                     else (q :: acc, ZM.add k tt seen)
+         | None => (acc, seen)
+         end)
+      (gcoords img) ([], ZM.empty unit) in
+  rev acc.
+
+(* Basin weight of every index, accumulated in one pass. *)
+Definition weight_map (img : gimage) (m : solvedmap) : ZM.t nat :=
+  fold_left (fun wm p => match mlookup img m p with
+                         | Some q => bump wm (ckey img q)
+                         | None => wm
+                         end)
+            (gcoords img) (ZM.empty nat).
+
+Definition wfind (img : gimage) (wm : ZM.t nat) (c : coord) : nat :=
+  match ZM.find (ckey img c) wm with Some n => n | None => 0%nat end.
 
 (* GS_DEFAULT (EXTRACT_REGIONS) speckle list: index in the bounding box
-   AND basin weight strictly greater than the threshold. *)
+   AND basin weight strictly greater than the threshold.  Same order and
+   contents as before; each weight is now looked up once. *)
 Definition peaks_default (img : gimage) (t : nat) (offs : list coord)
                          (xmin xmax ymin ymax : Z) : list (Z * Z * nat) :=
+  let m  := solved_map img offs in
+  let wm := weight_map img m in
   fold_right
     (fun c acc =>
        let '(cx, cy) := c in
-       if inbox xmin xmax ymin ymax cx cy && Nat.ltb t (weight img offs c)
-       then (cx, cy, weight img offs c) :: acc
+       let w := wfind img wm c in
+       if inbox xmin xmax ymin ymax cx cy && Nat.ltb t w
+       then (cx, cy, w) :: acc
        else acc)
-    [] (candidates img offs).
+    [] (candidates_from img m).
 
 (* ---- Public entry points, matching the Python _get_peaks call. -------
    `all_adjacent` selects the C offset array (c_offsets), exactly as

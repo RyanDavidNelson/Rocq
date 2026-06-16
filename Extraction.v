@@ -22,6 +22,14 @@ Extract Inlined Constant Nat.leb => "(<=)".
 Extract Inlined Constant Nat.even => "(fun n -> n mod 2 = 0)".
 Extract Inlined Constant Nat.odd  => "(fun n -> n mod 2 <> 0)".
 
+(* ---- nat<->Z conversions as O(1): both map to native [int], so the
+   default extractions (Coq_Pos.of_succ_nat etc.) are O(n) unary walks that
+   would make every dimension-dependent helper (zw/zh/inb/oob0/ckey) O(w+h)
+   per call.  of_nat is the identity (nat values are >= 0); to_nat clamps
+   negatives to 0, exactly matching Z.to_nat. --- *)
+Extract Inlined Constant Z.of_nat => "(fun n -> n)".
+Extract Inlined Constant Z.to_nat => "(fun z -> if z < 0 then 0 else z)".
+
 (* ---- floored Z.div / Z.modulo to match Coq (OCaml's are truncated) --- *)
 Extract Constant Z.div =>
   "(fun a b -> if b = 0 then 0 else
