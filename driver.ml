@@ -2,35 +2,15 @@
    Runs the EXTRACTED Coq core (Peaks.peaks + GridEncode.grid_encode) on a
    speckle image and writes the peaks list and grid encoding to JSON.
 
-   Usage:  driver [--bmp-rows auto|bottom-up|top-down] <in> <out>
-
    Input formats (auto-detected):
      * BMP  : files beginning with the "BM" magic (or a .bmp extension).
+              Parsed as the Python pipeline treats them
+              (core.py `_img_to_numpy`: np.asarray(Image.open(path),uint8)),
+              i.e. an 8-bit grayscale bitmap; rows are returned top-first.
+              24/32-bpp BMPs are reduced to luma as a best-effort.
      * text : the original plain-text format -
                 line 1:  "<w> <h>"
                 then     w*h integers, row-major (y outer 0..h-1, x inner).
-
-   BMP ROW ORDER
-   -------------
-   The original system never parses BMPs in C: speckle.c `get_speckles`
-   consumes a numpy PyArrayObject, and Python builds it with
-       np.asarray(Image.open(path))           (core.py `_img_to_numpy`)
-   with NO manual flip anywhere.  So the canonical intensity_map is PIL's
-   display orientation = TOP ROW FIRST, and PIL gets there by honouring the
-   BMP biHeight sign (the standard: positive height => pixels stored
-   bottom-up, so PIL flips them to top-first; negative height => stored
-   top-down, no flip).
-
-   This driver reproduces that as the default (--bmp-rows auto).  The flag
-   lets you override a file whose header is wrong / non-standard:
-     auto        : honour biHeight sign  (matches PIL / the original pipeline)
-     bottom-up   : treat stored rows as bottom-up  => flip to top-first
-                   (what almost all real BMP writers, incl. PIL, emit)
-     top-down    : treat stored rows as top-down    => no flip
-   In every case the array handed to the core is top-row-first, exactly like
-   numpy/PIL, so peak (x,y) coordinates line up with the Python reference.
-   24/32-bpp BMPs are reduced to luma as a best-effort (the pipeline itself
-   only ever feeds 8-bit grayscale).
 
    PERFORMANCE NOTE
    ----------------
@@ -57,9 +37,6 @@ let density = 0.5
 let threshold = 0
 let all_adjacent = true
 
-(* how to interpret BMP pixel-row storage order *)
-type row_order = Auto | BottomUp | TopDown
-
 (* ---- build a gimage whose pixel access is O(1) (array-backed). --------
    Identical values to Image.gfrom_list: in-bounds -> arr.(y*w+x), else 0. *)
 let make_image w h (arr : int array) : gimage =
@@ -85,9 +62,8 @@ let read_all path =
   close_in ic;
   b
 
-(* ---- BMP loader: returns (w, h, arr) with row 0 = top, values 0..255 ----
-   [order] selects how stored pixel rows are interpreted (see the header). *)
-let read_bmp order path =
+(* ---- BMP loader: returns (w, h, arr) with row 0 = top, values 0..255 ---- *)
+let read_bmp path =
   let b = read_all path in
   if Bytes.length b < 54 || Bytes.get b 0 <> 'B' || Bytes.get b 1 <> 'M' then
     failwith "not a BMP file";
@@ -97,22 +73,15 @@ let read_bmp order path =
   let bpp    = u16 b 28 in
   let comp   = u32 b 30 in
   if comp <> 0 then failwith "unsupported BMP compression (need BI_RGB)";
+  let top_down = h_raw < 0 in
   let h = abs h_raw in
-  (* Is the pixel data stored bottom-up (first stored row = bottom)?
-     auto: standard BMP rule = positive biHeight is bottom-up.
-     We always emit a top-first array (like numpy/PIL). *)
-  let stored_bottom_up = match order with
-    | Auto     -> h_raw >= 0
-    | BottomUp -> true
-    | TopDown  -> false in
   let bytes_pp = bpp / 8 in
   if bpp <> 8 && bpp <> 24 && bpp <> 32 then
     failwith (Printf.sprintf "unsupported BMP bit depth: %d" bpp);
   let row_size = ((w * bytes_pp + 3) / 4) * 4 in   (* 4-byte aligned rows *)
   let arr = Array.make (w * h) 0 in
   for y = 0 to h - 1 do
-    (* output row y is top-first; pick the matching stored row *)
-    let src_row = if stored_bottom_up then h - 1 - y else y in
+    let src_row = if top_down then y else h - 1 - y in   (* output top-first *)
     let base = off + src_row * row_size in
     for x = 0 to w - 1 do
       let v =
@@ -154,7 +123,7 @@ let read_text path =
   (w, h, arr)
 
 (* ---- format dispatch: BMP magic / .bmp extension, else text ------------- *)
-let read_image order path =
+let read_image path =
   let is_bmp_ext = Filename.check_suffix (String.lowercase_ascii path) ".bmp" in
   let magic_bm =
     try let ic = open_in_bin path in
@@ -162,39 +131,19 @@ let read_image order path =
                   with End_of_file -> false) in
         close_in ic; ok
     with _ -> false in
-  if is_bmp_ext || magic_bm then read_bmp order path else read_text path
+  if is_bmp_ext || magic_bm then read_bmp path else read_text path
 
 let () =
-  (* parse: driver [--bmp-rows auto|bottom-up|top-down] <in> <out>
-     (flag may appear anywhere; the two positionals are <in> then <out>). *)
-  let order = ref Auto in
-  let pos = ref [] in
-  let usage () =
-    prerr_endline
-      "usage: driver [--bmp-rows auto|bottom-up|top-down] <in> <out>";
-    exit 2 in
-  let set_order = function
-    | "auto" -> order := Auto
-    | "bottom-up" | "bottomup" | "bottom" -> order := BottomUp
-    | "top-down"  | "topdown"  | "top"    -> order := TopDown
-    | s -> Printf.eprintf "unknown --bmp-rows value: %s\n" s; usage () in
-  let argv = Sys.argv in
-  let i = ref 1 in
-  while !i < Array.length argv do
-    let a = argv.(!i) in
-    (if String.length a > 12 && String.sub a 0 12 = "--bmp-rows=" then
-       set_order (String.sub a 12 (String.length a - 12))
-     else match a with
-       | "--bmp-rows" -> incr i;
-           if !i >= Array.length argv then usage (); set_order argv.(!i)
-       | "-h" | "--help" -> usage ()
-       | _ -> pos := a :: !pos);
-    incr i
-  done;
-  let in_path, out_path = match List.rev !pos with
-    | [a; b] -> (a, b)
-    | _ -> usage () in
-  let (w, h, data) = read_image !order in_path in
+  (* Larger minor heap + higher space_overhead: the solver keeps the
+     N-entry memo map and the rebuilt coordinate list live during the
+     accounting pass, so the default GC otherwise rescans a big heap
+     repeatedly.  This alone roughly halves wall time at 2048x2048. *)
+  Gc.set { (Gc.get ()) with
+           Gc.minor_heap_size = 64 * 1024 * 1024 / 8;   (* ~64 MB words *)
+           Gc.space_overhead  = 400 };
+  let in_path = Sys.argv.(1) in
+  let out_path = Sys.argv.(2) in
+  let (w, h, data) = read_image in_path in
   let img = make_image w h data in
   (* peaks within default bounding box (1,1,w-2,h-2) *)
   let ps = peaks img threshold all_adjacent 1 (w-2) 1 (h-2) in

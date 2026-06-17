@@ -1,82 +1,46 @@
-(* ===================================================================== *)
-(*  Extraction.v                                                         *)
-(*  Extract the COMPUTATIONAL core of Peaks.v + GridEncode.v to OCaml.    *)
-(*  Coq reals are mapped to OCaml [float]; nat and Z to native [int].     *)
-(*  The only non-trivial mappings are floored Z.div / Z.modulo (Coq's    *)
-(*  reals/integers are floored; OCaml's are truncated) which matters for  *)
-(*  Image.wrap's numpy negative-index semantics.                         *)
-(* ===================================================================== *)
-
-From Coq Require Import ZArith List Reals QArith.
-From Coq Require Import ClassicalDedekindReals.
-From Coq Require Import Extraction.
-From Coq Require Import ExtrOcamlBasic.
-From Coq Require Import ExtrOcamlNatInt.
-From Coq Require Import ExtrOcamlZInt.
+From Coq Require Import extraction.ExtrOcamlBasic.
+From Coq Require Import extraction.ExtrOcamlNatInt.
+From Coq Require Import extraction.ExtrOcamlZInt.
+From Coq Require Import ZArith Reals QArith Qreals.
 From SpecklePUF Require Import Image Peaks GridEncode.
 
-(* ---- nat comparisons as O(1) int ops (override any recursive defs) --- *)
-Extract Inlined Constant Nat.eqb => "(=)".
-Extract Inlined Constant Nat.ltb => "(<)".
-Extract Inlined Constant Nat.leb => "(<=)".
-Extract Inlined Constant Nat.even => "(fun n -> n mod 2 = 0)".
-Extract Inlined Constant Nat.odd  => "(fun n -> n mod 2 <> 0)".
+Extraction Language OCaml.
 
-(* ---- nat<->Z conversions as O(1): both map to native [int], so the
-   default extractions (Coq_Pos.of_succ_nat etc.) are O(n) unary walks that
-   would make every dimension-dependent helper (zw/zh/inb/oob0/ckey) O(w+h)
-   per call.  of_nat is the identity (nat values are >= 0); to_nat clamps
-   negatives to 0, exactly matching Z.to_nat. --- *)
-Extract Inlined Constant Z.of_nat => "(fun n -> n)".
-Extract Inlined Constant Z.to_nat => "(fun z -> if z < 0 then 0 else z)".
+(* ---- performance fixes: kill the O(value) Peano conversions --------- *)
+Extract Inlined Constant Z.of_nat        => "(fun n -> n)".
+Extract Inlined Constant Pos.of_succ_nat => "(fun n -> n + 1)".
+Extract Inlined Constant Z.to_nat        => "(fun n -> if n < 0 then 0 else n)".
+Extract Inlined Constant Pos.to_nat      => "(fun n -> n)".
 
-(* ---- floored Z.div / Z.modulo to match Coq (OCaml's are truncated) --- *)
-Extract Constant Z.div =>
-  "(fun a b -> if b = 0 then 0 else
-     let q = a / b and r = a mod b in
-     if r <> 0 && (r < 0) <> (b < 0) then q - 1 else q)".
-Extract Constant Z.modulo =>
-  "(fun a b -> if b = 0 then a else
-     let r = a mod b in
-     if r <> 0 && (r < 0) <> (b < 0) then r + b else r)".
+(* ---- real type + primitive ops -> OCaml double ----------------------
+   Use *Extract Constant* (NOT Inlined) for the sealed-module members so
+   their definitions are emitted and RbaseSymbolsImpl still satisfies its
+   signature; the global R notation then resolves to float in signatures. *)
+Extract Constant R       => "float".
+Extract Constant R0      => "0.".
+Extract Constant R1      => "1.".
+Extract Constant Rplus   => "(+.)".
+Extract Constant Rmult   => "( *. )".
+Extract Constant Ropp    => "(fun x -> -. x)".
+Extract Constant RinvImpl.Rinv => "(fun x -> 1. /. x)".
+(* dead constructive bridge fields, pinned to type-correct dummies *)
+Extract Constant RbaseSymbolsImpl.Rabst => "(fun _ -> 0.)".
+Extract Constant RbaseSymbolsImpl.Rrepr => "(fun _ -> assert false)".
 
-(* ---- The real-number layer mapped onto OCaml float -------------------- *)
-Extract Inlined Constant R   => "float".
-Extract Inlined Constant R0  => "0.0".
-Extract Inlined Constant R1  => "1.0".
-Extract Inlined Constant Rplus  => "(+.)".
-Extract Inlined Constant Rmult  => "( *. )".
-Extract Inlined Constant Rminus => "(-.)".
-Extract Inlined Constant Ropp   => "(~-.)".
-Extract Inlined Constant Rdiv   => "(/.)".
-Extract Inlined Constant Rinv   => "(fun x -> 1.0 /. x)".
-Extract Inlined Constant IZR    => "float_of_int".
-Extract Inlined Constant INR    => "float_of_int".
-Extract Inlined Constant sqrt   => "Stdlib.sqrt".
-Extract Inlined Constant PI     => "(4.0 *. atan 1.0)".
-Extract Inlined Constant Rpower => "(fun x y -> exp (y *. log x))".
-
-(* floor / ceil helpers (Coq Int_part = floor, up = floor + 1) *)
-Extract Inlined Constant Int_part => "(fun x -> int_of_float (floor x))".
-Extract Inlined Constant up       => "(fun x -> (int_of_float (floor x)) + 1)".
-
-(* real comparison deciders -> bool (sumbool is mapped to bool below) *)
-Extract Inductive sumbool => "bool" [ "true" "false" ].
-Extract Inlined Constant Rle_dec => "(fun x y -> x <= y)".
+(* derived ops / library functions used by the grid geometry *)
+Extract Inlined Constant Rminus  => "(-.)".
+Extract Inlined Constant Rdiv    => "(/.)".
 Extract Inlined Constant Rlt_dec => "(fun x y -> x < y)".
+Extract Inlined Constant Rle_dec => "(fun x y -> x <= y)".
+Extract Inlined Constant IZR     => "float_of_int".
+Extract Inlined Constant INR     => "float_of_int".
+Extract Inlined Constant Q2R     => "(fun q -> float_of_int q.qnum /. float_of_int q.qden)".
+Extract Inlined Constant sqrt    => "Stdlib.sqrt".
+Extract Inlined Constant cos     => "Stdlib.cos".
+Extract Inlined Constant sin     => "Stdlib.sin".
+Extract Inlined Constant PI      => "(4. *. Stdlib.atan 1.)".
+Extract Inlined Constant Rpower  => "(fun x y -> x ** y)".
+Extract Inlined Constant up      => "(fun x -> int_of_float (Stdlib.floor x) + 1)".
 
-(* The classical-reals decidability axiom underlies Coq's real *construction*.
-   We've mapped every real OPERATION to OCaml floats, so this is never reached
-   computationally; we realize it as a (lazy) function only so the extracted
-   module does not raise at load time. *)
-Extract Constant sig_forall_dec => "(fun _ -> None)".
-
-(* ---- The entry points we hand to the OCaml driver -------------------- *)
-(* peaks within a bounding box; grid_encode for a chosen grid style;
-   gfrom_list to build images; the grid_style constructors. *)
-Extraction "speckle_core.ml"
-  Image.gfrom_list
-  Image.gw Image.gh
-  Peaks.peaks Peaks.peaks_full
-  Peaks.GSquare Peaks.GHex
-  GridEncode.grid_encode.
+Extraction "Speckle_core.ml"
+  peaks peaks_full grid_encode GHex GSquare.
