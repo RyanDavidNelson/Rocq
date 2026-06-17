@@ -56,13 +56,19 @@
 (*    toward zero == floor for nonnegative reals; modelled by floor. *)
 (*                                                                       *)
 (*  BUILD NOTE                                                           *)
-(*  This file targets mathcomp + mathcomp-analysis (tested on analysis   *)
-(*  1.0.0 / MathComp 2.1.0 / Coq 8.18).  The version-sensitive spots are *)
-(*  the probability hypotheses: analysis 1.0.0 has no [uniform_probability]*)
-(*  and no independence predicate, so Goodman's Chapter-2 assumptions are *)
-(*  carried here as EXPLICIT named hypotheses (their physical content --  *)
-(*  the elementary first moments and the CLT limit -- is assumed, not     *)
-(*  re-derived).  Spots that move across releases are flagged [API].      *)
+(*  This file targets mathcomp + mathcomp-analysis on Rocq 9.1.  The      *)
+(*  current analysis DOES ship [uniform_prob] (uniform_distribution.v),   *)
+(*  [exponential_prob] (exponential_distribution.v) and the [cdf]/[ccdf]  *)
+(*  layer (random_variable.v), so the limit law in Section 4 is now       *)
+(*  DERIVED rather than assumed.  Two physics inputs remain assumed (the  *)
+(*  trust boundary): (i) the elementary first moments E[cos]=E[sin]=0     *)
+(*  and (ii) the CLT.  Re (i): these are no longer fundamental -- they    *)
+(*  follow from [xi y x ~ U[0,1]] via [integral_distribution] +           *)
+(*  [integral_uniform] + [continuous_FTC2] on the two integrals           *)
+(*  \int_0^1 cos(2*pi*u) du = \int_0^1 sin(2*pi*u) du = 0; see the note    *)
+(*  above [E_cos_phasor] for the drop-in derivation.  Re (ii): the CLT    *)
+(*  has no counterpart in analysis yet, so it stays assumed.  Spots that  *)
+(*  move across releases are flagged [API].                              *)
 (* ===================================================================== *)
 
 From mathcomp Require Import all_ssreflect all_algebra.
@@ -241,12 +247,28 @@ Definition sphasor (y x : nat) : T -> R := fun t => sin (2%:R * pi * xi y x t).
 (* ---- The model hypotheses = Goodman's Chapter-2 assumptions. ----------
    These encode the PHYSICS inputs and are assumed, not re-derived. ------ *)
 
-(* (H-moments)  ELEMENTARY FIRST MOMENTS, Goodman Eqs. (2.3)-(2.4).
-   For a phase uniform over a full 2pi range, E[cos phi] = E[sin phi] = 0.
-   This is precisely Goodman's uniform-phase hypothesis and its first-order
-   moment consequence; per the brief we take Goodman's derivation as given
-   rather than re-evaluating the elementary integral
-       \int_0^1 cos(2*pi*u) du = \int_0^1 sin(2*pi*u) du = 0. *)
+(* (H-moments)  ELEMENTARY FIRST MOMENTS, Goodman Eqs. (2.3)-(2.4):
+   for a phase uniform over a full 2pi range, E[cos phi] = E[sin phi] = 0.
+
+   RECOMMENDED REFACTOR (now that analysis ships [uniform_prob]).  These two
+   need not be assumed: they follow from Goodman's actual Chapter-2 input,
+   namely [xi y x ~ U[0,1]].  Replace the two hypotheses below by the single
+   law hypothesis
+       Hypothesis xi_uniform : forall y x, in_block ->
+         distribution P (xi y x) = uniform_prob (@ltr01 R) :> (set R -> \bar R).
+   and derive each moment as a lemma along this chain (all lemmas exist in
+   the current library; only the two FTC2 integrals are nontrivial):
+     'E_P[cphasor y x]
+       = \int[P]_t ((fun u => (cos (2*pi*u))%:E) (xi y x t))      (* defn of E *)
+       = \int[distribution P (xi y x)]_u (cos (2*pi*u))%:E         (* integral_distribution; cos bounded => integrable on prob. P *)
+       = \int[uniform_prob (ltr01 R)]_u (cos (2*pi*u))%:E          (* xi_uniform *)
+       = (1-0)^-1 *: \int[mu]_(u in `[0,1]) (cos (2*pi*u))%:E      (* integral_uniform, after a cos+1>=0 shift since integral_uniform needs f>=0 *)
+       = 0                                                         (* continuous_FTC2 with antiderivative sin(2*pi*u)/(2*pi); sin(2*pi)=sin 0=0 *)
+   The sin case is identical with antiderivative -cos(2*pi*u)/(2*pi) and
+   cos(2*pi)=cos 0=1 cancelling.  Template: the [intsin] proof in
+   pi_irrational.v (\int_[0,pi] sin = 2 via [continuous_FTC2] + [-cos]).
+   Imports needed: [uniform_distribution ftc derive realfun].  Until those
+   two integrals are checked on your build, the moments are kept ASSUMED: *)
 Hypothesis E_cos_phasor :
   forall y x, (x < szX n k)%N -> (y < szY m k)%N ->
   ('E_P[ cphasor y x ] = 0)%E.
@@ -365,8 +387,8 @@ Local Open Scope ereal_scope.
 Lemma cdf_fully_developed (t : R) : (0 < t)%R ->
   cdf W t = (1 - (expR (- t)%R)%:E).
 Proof.
-move=> t0; rewrite (W_fully_developed _ (ltW t0)).
-by rewrite exponential_prob_itv0c// mulN1r.
+move=> t0; have t0' : (0 <= t)%R := ltW t0.
+by rewrite W_fully_developed// exponential_prob_itv0c// mulN1r.
 Qed.
 
 (* THE FINAL THEOREM (solved).  Negative-exponential survival law: the
